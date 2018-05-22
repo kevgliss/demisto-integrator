@@ -111,4 +111,4 @@ demisto-custom-content/
 Pipfile.lock
 Pipfile
 .DS_Store
-.idea/
+.id

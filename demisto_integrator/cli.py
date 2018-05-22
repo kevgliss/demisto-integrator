@@ -279,21 +279,6 @@ def filename_to_ui(value):
     return value
 
 
-def create_directory(ctx, param, value):
-    """Creates a new directory and any sub directories. If path does not already exist."""
-    if value:
-        return value
-
-    value = 'demisto-custom-content'
-    value = os.path.join(os.getcwd(), value)
-
-    # we are creating a dir lets initialize it
-    try:
-        return Repo(value)
-    except NotGitRepository as e:
-        return Repo.init(value, mkdir=True)
-
-
 class RepoParamType(click.ParamType):
     name = 'repo'
 
@@ -303,19 +288,18 @@ class RepoParamType(click.ParamType):
 
         try:
             st = os.stat(rv)
+
+            file_name = filename_to_ui(value)
+            if not stat.S_ISDIR(st.st_mode):
+                self.fail(f'"{file_name}" is not a directory.', param, ctx)
+
+            if not os.access(value, os.W_OK):
+                self.fail(f'"{file_name}" is not writable.', param, ctx)
+
+            if not os.access(value, os.R_OK):
+                self.fail(f'"{file_name}" is not readable.', param, ctx)
         except OSError:
-            # if it doesn't exists we create it in the callback.
-            return
-
-        file_name = filename_to_ui(value)
-        if not stat.S_ISDIR(st.st_mode):
-            self.fail(f'"{file_name}" is not a directory.', param, ctx)
-
-        if not os.access(value, os.W_OK):
-            self.fail(f'"{file_name}" is not writable.', param, ctx)
-
-        if not os.access(value, os.R_OK):
-            self.fail(f'"{file_name}" is not readable.', param, ctx)
+            pass
 
         try:
             return Repo(rv)
@@ -358,7 +342,7 @@ def integrator_cli():
 
 
 @integrator_cli.command()
-@click.option('--custom-content-repo', type=RepoParamType(), callback=create_directory)
+@click.option('--custom-content-repo', type=RepoParamType(), default=os.path.join(os.getcwd(), 'demisto-custom-content'))
 def sync(custom_content_repo):
     # make sure content repo is up to date, if it doesn't exist clone the demisto folder
     click.secho('Ensuring that demisto content is up to date... ', nl=False)
