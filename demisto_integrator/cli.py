@@ -5,6 +5,7 @@ import stat
 import logging
 import fnmatch
 import difflib
+from datetime import date
 from shutil import copyfile
 
 import click
@@ -12,7 +13,7 @@ import click_log
 
 from dulwich.repo import Repo
 from dulwich.errors import NotGitRepository
-from dulwich.porcelain import clone, open_repo_closing, commit
+from dulwich.porcelain import clone, open_repo_closing, commit, tag_create, tag_list
 
 from ._version import __version__
 
@@ -335,32 +336,69 @@ def add(content_repo, custom_content_repo, paths):
         r.stage(paths)
 
 
-@click.group()
-@click.version_option(version=__version__)
-def integrator_cli():
-    pass
-
-
-@integrator_cli.command()
-@click.option('--custom-content-repo', type=RepoParamType(), default=os.path.join(os.getcwd(), 'demisto-custom-content'))
-def sync(custom_content_repo):
-    # make sure content repo is up to date, if it doesn't exist clone the demisto folder
-    click.secho('Ensuring that demisto content is up to date... ', nl=False)
-
+def update_content():
+    """Fetches the latest changes from `demisto-content`"""
     try:
         clone(DEMISTO_CONTENT_URL, DEMISTO_CONTENT_DIR)
     except FileExistsError as e:
         pass
 
-    content_repo = Repo(DEMISTO_CONTENT_DIR)
+    return Repo(DEMISTO_CONTENT_DIR)
 
+
+def determine_version(repo):
+    """Determines the correct next version"""
+    tags = [x.decode('utf-8') for x in tag_list(repo)]
+    tags.sort(key=lambda s: [int(u) for u in s.split('.')])
+
+    today = date.today()
+    this_year = str(today.year)[2:]  # ignore the millennium
+
+    index = 0
+    if tags:
+        year, month, index = tags[-1].split('.')
+        if year == this_year:
+            if month == str(today.month):
+                index = int(index) + 1
+
+    return f'{this_year}.{today.month}.{index}'
+
+
+def calculate_diff(a, b):
+    """Creates a unified diff between two files."""
+    with open(a, 'rb') as cp:
+        with open(b, 'rb') as cc:
+            src_lines = [x.decode('utf-8', 'ignore') for x in list(cp)]
+            dst_lines = [x.decode('utf-8', 'ignore') for x in list(cc)]
+            return list(difflib.unified_diff(src_lines, dst_lines))
+
+
+def create_release(custom_content_repo):
+    """Creates a new release by committing and tagging changes."""
+    version = determine_version(custom_content_repo)
+    commit(custom_content_repo, b'Demisto custom content sync.')
+    tag_create(custom_content_repo, version, message=b'Automatic release based on demisto-content update.')
+    return version
+
+
+def confirm(msg, force=None, default=False):
+    """Wrapper to allow confirmations to be forced."""
+    if force:
+        return True
+
+    return click.confirm(msg, default=default)
+
+
+def sync(custom_content_repo, force=None):
+    """Syncs content between `demisto-content` and a custom repository."""
+    click.secho('Ensuring that demisto content is up to date... ', nl=False)
+    content_repo = update_content()
     click.secho('Done!', fg='green')
+
     click.secho('Filtering ignored files... ', nl=False)
     content_files = list_files(content_repo.path)
-    click.secho('Done!', fg='green')
-
-    # check to see if the non-filtered files exist in our repo
     custom_content_files = list_files(custom_content_repo.path)
+    click.secho('Done!', fg='green')
 
     add_all = False
     modify_all = False
@@ -374,49 +412,63 @@ def sync(custom_content_repo):
                 staged_files.append(partial_path)
                 continue
 
-            if click.confirm('Do you want to add this file?'):
+            if confirm('Do you want to add this file?', force=force, default=True):
                 staged_files.append(partial_path)
-                if click.confirm('Do you want to add all new files?'):
+                if confirm('Do you want to add all new files?', force=force):
                     add_all = True
         else:
-            with open(os.path.join(content_repo.path, partial_path), 'rb') as cp:
-                with open(os.path.join(custom_content_repo.path, partial_path), 'rb') as cc:
-                    src_lines = [x.decode('utf-8', 'ignore') for x in list(cp)]
-                    dst_lines = [x.decode('utf-8', 'ignore') for x in list(cc)]
-                    diff = list(difflib.unified_diff(src_lines, dst_lines))
+            content_path = os.path.join(content_repo.path, partial_path)
+            custom_path = os.path.join(custom_content_repo.path, partial_path)
 
-                    if diff:
-                        click.secho(f'{partial_path} ', nl=False)
-                        click.secho('Modified!', fg='yellow')
+            diff = calculate_diff(content_path, custom_path)
 
-                        if modify_all:
-                            staged_files.append(partial_path)
-                            continue
+            if diff:
+                click.secho(f'{partial_path} ', nl=False)
+                click.secho('Modified!', fg='yellow')
 
-                        if click.confirm('Do you want to view diff?'):
-                            for d in diff:
-                                if d.startswith('-'):
-                                    click.secho(d, fg='red', nl=False)
-                                elif d.startswith('+'):
-                                    click.secho(d, fg='green', nl=False)
-                                else:
-                                    click.echo(d, nl=False)
+                if modify_all:
+                    staged_files.append(partial_path)
+                    continue
 
-                        if click.confirm('Do you want to accept these changes?'):
-                            staged_files.append(partial_path)
-                            if click.confirm('Do you want to add all modified files?'):
-                                add_all = True
+                if confirm('Do you want to view diff?', force=force):
+                    for d in diff:
+                        if d.startswith('-'):
+                            click.secho(d, fg='red', nl=False)
+                        elif d.startswith('+'):
+                            click.secho(d, fg='green', nl=False)
+                        else:
+                            click.echo(d, nl=False)
+
+                if confirm('Do you want to accept these changes?', force=force, default=True):
+                    staged_files.append(partial_path)
+                    if confirm('Do you want to add all modified files?', force=force):
+                        add_all = True
 
     add(content_repo, custom_content_repo, staged_files)
 
     if len(staged_files):
-        click.echo(f'{len(staged_files)} have been staged.')
-        if click.confirm('Do you want to create a commit with your changes?'):
-            commit(custom_content_repo, b'Demisto custom content sync.')
+        click.echo(f'{len(staged_files)} files have been staged.')
+        if confirm('Do you want to create a new release with these changes?', force=force, default=True):
+            version = create_release(custom_content_repo)
+            click.echo('A new released has been created. Tag: ', nl=False)
+            click.secho(version, fg='green')
     else:
         click.echo('No files new files added to stage.')
 
     click.secho('Content sync complete.', fg='green')
+
+
+@click.group()
+@click.version_option(version=__version__)
+def integrator_cli():
+    pass
+
+
+@integrator_cli.command(name='sync', help=sync.__doc__)
+@click.option('--custom-content-repo', type=RepoParamType(), default=os.path.join(os.getcwd(), 'demisto-custom-content'))
+@click.option('--force', is_flag=True)
+def sync_cmd(custom_content_repo, force):
+    return sync(custom_content_repo, force=force)
 
 
 def entry_point():
